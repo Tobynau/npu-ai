@@ -39,7 +39,8 @@ methods and the dead ends are in [docs/02-results.md](docs/02-results.md).
 | Path | What |
 |---|---|
 | `npu/xdna1_gemm.py` | shape-agnostic bf16 GEMM on all 16 cores: padding, chunking, resident weights, zero-copy pinned host buffers |
-| `npu/xdna1_attention.py`, `npu/kernels/xdna1_attn.cc` | fused flash-style attention for all batch x head pairs in one dispatch |
+| `npu/xdna1_program.py`, `npu/kernels/xdna1_attn.cc` | one NPU program for the GEMMs and the fused flash-style attention (all batch x head pairs in one dispatch), so the NPU is not reconfigured between them (~2.5 ms each way with two programs) |
+| `npu/xdna1_attention.py` | the earlier standalone attention program, kept for A/B measurements |
 | `comfyui/custom_nodes/comfyui_xdna1_npu/` | ComfyUI nodes: *Offload Linear layers*, *Status*, *Release*; a timing gate picks NPU or CPU per shape |
 | `setup/amdxdna-usage/` | DKMS-patched `amdxdna` driver exposing `npu_busy_percent`, busy time and memory use in sysfs |
 | `docker/` | image with Ubuntu's XRT, mlir-aie 1.4.4 and Peano; second image for hawkpoint-npu-llm |

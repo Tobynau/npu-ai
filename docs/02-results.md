@@ -775,6 +775,117 @@ the result is no longer rounded to bf16 on the way out). Host work per 32x32 cal
 it is the program switch above, which only a GEMM-plus-attention program removes (`03-next-steps.md`).
 
 
+## 3e. One NPU program for the GEMMs and the attention (`npu/xdna1_program.py`)
+
+Removes the program switch measured at the end of 3d: `NpuGemm` no longer runs mlir-aie's `whole_array`
+GEMM and the attention as separate programs. One IRON design does both; a runtime parameter tells the cores
+which one a dispatch is, and the shim, memtile and core DMAs move both through the same object streams, so the
+firmware has nothing to reconfigure between a Linear layer and an attention block.
+
+**Why one program per head dimension, not one in total.** A core has 16 KB of program memory. The attention
+kernel for one head dimension is 9.5-10.3 KB of it; the merged cores come to 15.0 KB (d = 80) and 15.2 KB
+(d = 40) with the GEMM, the Q conversion and both control flows, so two head dimensions do not fit. `NpuGemm`
+compiles one program per head dimension (SD1.5: 40 and 80), both with the GEMM, and sends each GEMM to whichever
+program ran last. In a UNet call the array is then reconfigured only where the attention changes level (64x64
+to 32x32 and back): 2 switches per call, counted by `NpuGemm.stats["program_switches"]`, instead of two per NPU
+attention layer (~20).
+
+**Design** (the module docstring has the details):
+
+* The streams are `whole_array`'s: per row of cores one stream broadcast to the row (Y), per column one
+  broadcast to the column (X), and per column one join of the four cores' outputs (Z). The core has two
+  input DMA channels and both programs used both, so the two dataflows had to agree on one routing.
+  `whole_array` needs A shared along rows and B along columns (that sharing is what keeps a GEMM within the
+  shim bandwidth); attention needs K/V shared along a column (as before) and a different Q per core, which no
+  broadcast delivers.
+* Q therefore rides the row stream: the four columns take four consecutive (batch, head) pairs, which in the
+  model's `(b, t, h*d)` layout are four adjacent heads, so the Q rows a row of cores needs in a round are one
+  `(bq x 4*hd)` slab of Q. The shim sends it in 16-column strips, each core keeps the quarter of every strip
+  that belongs to its head and converts it to bf16 as before. Each core now receives four cores' worth of Q.
+* The GEMM uses the attention's tiles and layouts: a `bq x hd` f32 C tile (the attention's output object)
+  from `bq x 32` A tiles (8x8, on the row stream) and `bk x hd` B tiles (8x4, the K/V layout, on the column
+  stream). Its micro-kernel is `gemm_step` in `xdna1_attn.cc` (2 row blocks x 2 column blocks per step). The C
+  tile accumulates in the attention's Q and K^T buffers, unused in GEMM mode, and is copied to the output
+  object at the end, so the core computes the next tile while the DMA drains the last one (no room for a
+  second output object: data memory is at ~60 of 64 KB for d = 40).
+* GEMM tiles: d = 80 program 32 x 32 x 80 (M % 128, K % 32, N % 320), d = 40 program 64 x 64 x 40 (M % 256,
+  K % 64, N % 160). The runner pads for both (M % 256, K % 64, N % 320), so SD1.5's N = 320 layers are no
+  longer padded to 384.
+* XRT allows 16 kernel arguments: three buffers and 13 parameters fit, Q's offset in its buffer did not, and
+  is now a sub-buffer handle.
+
+Measured (load 1-2 unless noted; logs `logs/*merged*`, helpers in `build/merge-scratch/`):
+
+| Same measurement as 3d (`ctxswitch.py`, `logs/11-attn-merged-ctxswitch.log`) | 2 programs (3d) | 1 program |
+|---|---:|---:|
+| 32x32 attention, calls back to back | 6.8-7.0 ms | 7.4-7.9 ms |
+| 32x32 attention after a 256x640x640 GEMM | 9.2-9.3 ms | **7.4-7.6 ms** |
+| 256x640x640 GEMM after an attention call | 2.5-2.6 ms | **0.58-0.66 ms** |
+| 2048x640x640 GEMM after an attention call | 3.7-4.1 ms | 2.0-2.7 ms |
+| 256x640x640 GEMM, calls back to back | 0.47 ms | 0.40 ms |
+| d = 40 block then d = 80 block (still two programs) | 2.8 / 9.3 ms | 2.8-3.0 / 10.0 ms |
+
+* Attention correctness is unchanged, bit for bit in the error figures (`scripts/11-attn-fused-test.py`:
+  8.80e-3 at 64x64, 8.00e-3 at 32x32, as in 3d). The NPU time per block went up by the extra Q traffic:
+  43.1 -> 43.6 ms at 64x64, 6.3 -> 6.5 ms at 32x32 (`logs/11-attn-merged-raw.log`). Through `NpuGemm` with Q in
+  place, 45.7 / 7.6 ms per block, and the same with a GEMM before every call (`--interleave`, 0 switches).
+* GEMMs (`scripts/05-gemm-test.py`, `logs/05-gemm-test-merged.log`, on the d = 80 program): all shapes match
+  torch as before; one UNet pass worth of SD1.5 Linear shapes **102 -> 86 ms of NPU time** (wall 133 -> 110 ms)
+  in that run. That run also had long-K shapes slower than `whole_array` (2048x2560x640 5.2 -> 7.9 ms), blamed
+  on the C tile going through the registers every 32 of K. Re-measured below ("GEMM K step"): the same binary
+  does 4.4 ms and 66 ms for the set, so that run was noisy, and the per-32 C traffic costs nothing measurable.
+* The host paths (`build/merge-scratch/host_paths.py`): Q in place at a nonzero offset (sub-buffer), head-major
+  input and output, 5 heads per batch (Q copied as groups of four pairs), padded and K/N-chunked GEMMs: all
+  match torch.
+
+**GEMM K step: 32 vs 64** (d = 80 program; load 1.4-2.2; logs `logs/05-gemm-test-k64*.log`,
+`logs/05-gemm-test-merged-rerun.log`, `logs/05-gemm-k64-ab.log`, `logs/11-attn-k64*-raw.log`; helpers
+`build/merge-scratch/k64_ab.py`, `with_kx1.py`, `with_orig_kernel.py`). The suspected cost: `gemm_step` takes one Y
+object (32 of K), so the 10 KB C tile is loaded into the accumulators and stored back once per 32 of K. The
+remedy tried: a compile-time `gemm_kx = 2` (kernel `-DGEMM_KX=2`, needs bk = 32), where one call takes two Y and two
+X objects (64 of K) with Y depth 4 (+4 KB of data memory, ~58 of 64 KB). The kernel's row-pair loop now runs
+over 1 or 2 K segments (`gemm_seg`), with the C blocks loaded and stored once per call.
+
+| d = 80 program, same load | 2048x2560x640 | 512x5120x1280 | 128x5120x1280 | 8192x1280x320 | SD1.5 set (16 shapes) | .text |
+|---|---:|---:|---:|---:|---:|---:|
+| `whole_array` (3c, `05-gemm-test-after.log`) | 5.18 | 8.80 | 2.77 | 5.33 | 102 ms | - |
+| 3e kernel as merged, K step 32 (re-run) | 4.40 | 4.69 | 3.54 | 4.27 | 66 ms | 15.0 KB |
+| new `gemm_step`, K step 32 (**default**) | 4.27-4.56 | 4.73-4.75 | 2.48-2.52 | 4.37-4.41 | 64-70 ms | **14.5 KB** |
+| new `gemm_step`, K step 64 (`gemm_kx=2`) | 4.19-4.67 | 4.85-5.34 | 2.51-3.80 | 4.25-4.30 | 68-71 ms | 15.2 KB |
+
+NPU ms per call through `NpuGemm`, 2-3 runs each; single shapes move by up to 1.3 ms between runs
+(128x5120x1280: 2.5 or 3.8 ms). An interleaved raw-dispatch A/B (`k64_ab.py`, 10 passes of 20 dispatches) gives
+2048x2560x640 at 4.26 / 4.55 ms (min / median) with K step 32 and 4.18 / 4.87 with K step 64, so the gain is
+2 % at best and inside the noise. The C tile's trips through the registers are hidden behind the input stream:
+2048x2560x640 moves ~73 MB through the shim (A twice, once per 320-wide column block; B 16 times, once per
+128-row block), ~17 GB/s at 4.2 ms, the ~13-20 GB/s ceiling of this NPU's shim. Long-K GEMMs need fewer bytes per
+flop (taller C tiles so B is re-sent less often), not fewer C round trips. K step 64 is therefore **off**
+(`GEMM_K64` in `npu/xdna1_program.py` is empty; `{80}` turns it on). The rewrite of `gemm_step` stays: at K step
+32 it is as fast as before and smaller (d = 80 `gemm_step` 1.3 -> 0.9 KB, core .text 15.0 -> 14.5 KB; d = 40
+unchanged at 15.2 KB), which gives back program memory. Attention is unchanged with every variant: raw dispatch
+6.4-6.5 ms min (6.5-6.8 median) at 32x32 for K step 32 and 64, Y depth 2 and 4; `11-attn-fused-test.py` 43.5-43.8 /
+6.5-6.9 ms (43.6 / 6.5 in `11-attn-merged-raw.log`; the variation is the load), errors bit-identical (8.80e-3,
+8.00e-3). `unified_smoke.py` (d = 80 and 40) and `host_paths.py` print ALL OK with both K steps.
+
+**ComfyUI, 4 steps, torch SDPA on the CPU** (`logs/06-comfy-sdpa-merged-4st.log`, load 1-4.5):
+
+| Run | Prompt total | Per UNet call | NPU per UNet call (warm) |
+|---|---:|---:|---|
+| CPU only (SDPA) | 24.3 s | - | - |
+| NPU, first prompt | 25.7 s | 3.6, 3.0, 3.2, 3.6 s | |
+| NPU, next prompt (warm) | **18.6 s** | 3.2, 3.1, 3.1, 3.1 s | GEMMs 0.43-0.44 s busy (version 10: 0.52-0.67), attention 0.27-0.28 s (0.28-0.30) |
+
+Same image as version 10 (2.88/255 mean difference to the CPU image, 88.9 % of pixels within 8/255), 2
+program switches per UNet call. The NPU's share of a UNet call dropped by ~0.15 s (switches ~50 ms, the rest
+the faster GEMM tiles); the call itself is 3.1 s against 3.0-3.5 s in version 10, inside the run-to-run spread
+on this machine, because the CPU's convolutions and the rest of the UNet are ~2.4 s of it. The attention gate
+measured the 32x32 level at 11 ms on its first NPU call, which also loaded the d = 80 program (the level
+change). The node now times a second call when the first one switched programs, after letting go of the first
+call's output so the second does not allocate a fresh pooled buffer inside the timing: the gate then decides
+the 32x32 level on **8 ms vs 11 ms** for the CPU (version 10: 10 vs 13) and the 64x64 level on 45 vs 104 ms
+(`logs/06-comfy-sdpa-merged-4st-gate.log`, NPU prompt only).
+
+
 ## 4. Benchmark matrix (`scripts/08-llm-bench-matrix.sh`)
 
 `llama-bench`, 3 repetitions, idle-ish machine. 6 threads = the six physical cores; 12 threads

@@ -443,3 +443,176 @@ void attn_round_finish(float *__restrict O, const float *__restrict l) {
 }
 
 } // extern "C"
+
+#ifdef UNIFIED
+//===----------------------------------------------------------------------===//
+// The unified program (npu/xdna1_program.py): the same cores also run the GEMMs, so the NPU never switches
+// between a GEMM program and an attention program. Both modes share the core's three object streams:
+//
+//   Y  (BQ x 32) bf16, 8x8 tiles: tile (i, j) at (i * 4 + j) * 64   GEMM: an A tile (32 columns of K)
+//                                                                  attention: a strip of the round's Q (below)
+//   X  (BK x HD) bf16, 8x4 tiles (the K/V layout above)            GEMM: a B tile (BK rows of K)
+//   Z  (BQ x HD) f32, 8x4 blocks (the O layout above)              GEMM: a C tile
+//
+// GEMM: C (BQ x HD) = A (BQ x K) @ B (K x HD), accumulated over BK / 32 Y objects per X object. The C tile is
+// kept in the two 5 KB buffers the attention uses for Q and K^T (row blocks [0, TQ/2) and [TQ/2, TQ)), which GEMM
+// mode does not otherwise touch, and copied into the output object once complete, so the core works on the next
+// tile while the DMA drains the last one (there is no room for a second output object). The C tile passes
+// through registers once per gemm_step call: with -DGEMM_KX=2 (BK = 32) a call takes two Y and two X objects
+// (64 of K), otherwise one Y object (32 of K).
+//
+// Q: a row of cores receives the Q of all four columns' pairs (four consecutive heads) as one (BQ x 4*HD) f32
+// slab, sent in strips of 16 columns. A strip travels as a Y object: the memtile's 8x8 bf16 retiling moves it
+// in 8-row x 4-float pieces, piece (i, j) at (i * 4 + j) * 32 floats. Pieces j = 2p and 2p + 1 are the left and
+// right halves of one 8x8 Q tile of one head; each core converts those of its own column's head into Qb.
+//===----------------------------------------------------------------------===//
+
+static_assert(BK % 32 == 0, "the unified program needs BK to be a multiple of the 32-column A strip");
+static_assert(TQ % 4 == 0, "the GEMM processes row blocks in pairs within each half of the C tile");
+constexpr int GA = 4;               // 8x8 A tiles along K in one Y object
+constexpr int CHALF = BQ * HD / 2;  // floats in one half of the C tile
+
+#ifndef GEMM_KX
+#define GEMM_KX 1 // X objects (B tiles) per gemm_step call: 1, or 2 (BK = 32: K step 64, two Y and two X objects)
+#endif
+static_assert(GEMM_KX == 1 || (GEMM_KX == 2 && BK == 32), "GEMM_KX = 2 pairs one Y object with each X object");
+
+// One 32-column K segment of the row pair: acc (row blocks i, i+1 x column blocks c, c+1) += A0 / A1 (8 x 32) @
+// B (32 x 8, column blocks c and c+1 of a 32-row B segment).
+static inline __attribute__((always_inline)) void
+gemm_seg(MM84 &y00, MM84 &y01, MM84 &y10, MM84 &y11, const bf16 *__restrict A0, const bf16 *__restrict A1,
+         const bf16 *__restrict B, int c) {
+#pragma clang loop unroll(full)
+  for (int j = 0; j < GA; j++) {
+    const V64bf a0 = aie::load_v<64>(A0 + j * 64);
+    const V64bf a1 = aie::load_v<64>(A1 + j * 64);
+    const bf16 *__restrict b = B + (j * ND4 + c) * 32;
+    const V32bf b0 = aie::load_v<32>(b);
+    const V32bf b1 = aie::load_v<32>(b + 32);
+    y00.mac(a0, b0);
+    y01.mac(a0, b1);
+    y10.mac(a1, b0);
+    y11.mac(a1, b1);
+  }
+}
+
+// C0 / C1 (8 x HD, row blocks i and i+1) += A0 / A1 (8 x 32 per segment) @ B (32 x HD per segment), over GEMM_KX
+// segments (A0[s], A1[s] against B[s]): two row blocks by two column blocks per step, four independent accumulator
+// chains; each A tile serves two B blocks and vice versa. The C blocks go through registers once per call, i.e.
+// once per 32 * GEMM_KX of K.
+static inline __attribute__((always_inline)) void
+gemm_rowpair(const bf16 *const A0[GEMM_KX], const bf16 *const A1[GEMM_KX], const bf16 *const B[GEMM_KX],
+             float *__restrict C0, float *__restrict C1) {
+  for (int c = 0; c < ND4; c += 2) {
+    MM84 y00(aie::load_v<32>(C0 + c * 32));
+    MM84 y01(aie::load_v<32>(C0 + (c + 1) * 32));
+    MM84 y10(aie::load_v<32>(C1 + c * 32));
+    MM84 y11(aie::load_v<32>(C1 + (c + 1) * 32));
+#pragma clang loop unroll(full)
+    for (int s = 0; s < GEMM_KX; s++)
+      gemm_seg(y00, y01, y10, y11, A0[s], A1[s], B[s], c);
+    aie::store_v(C0 + c * 32, y00.template to_vector<float>());
+    aie::store_v(C0 + (c + 1) * 32, y01.template to_vector<float>());
+    aie::store_v(C1 + c * 32, y10.template to_vector<float>());
+    aie::store_v(C1 + (c + 1) * 32, y11.template to_vector<float>());
+  }
+}
+
+extern "C" {
+
+#if GEMM_KX == 2
+// One K step of 64: C += A @ B over two Y objects (Aa, Ab: 32 columns of K each) and the two X objects that hold
+// the matching 32 rows of B (Ba, Bb); C split over Clo / Chi (bf16 buffers used as f32).
+void gemm_step(const bf16 *__restrict Aa, const bf16 *__restrict Ab, const bf16 *__restrict Ba,
+               const bf16 *__restrict Bb, bf16 *__restrict Clo, bf16 *__restrict Chi) {
+  event0();
+  float *lo = reinterpret_cast<float *>(Clo);
+  float *hi = reinterpret_cast<float *>(Chi);
+  const bf16 *const B[2] = {Ba, Bb};
+  for (int i = 0; i < TQ; i += 2) {
+    float *Ci = i < TQ / 2 ? lo + i * ND4 * 32 : hi + (i - TQ / 2) * ND4 * 32;
+    const bf16 *const A0[2] = {Aa + i * GA * 64, Ab + i * GA * 64};
+    const bf16 *const A1[2] = {Aa + (i + 1) * GA * 64, Ab + (i + 1) * GA * 64};
+    gemm_rowpair(A0, A1, B, Ci, Ci + ND4 * 32);
+  }
+  event1();
+}
+#else
+// One K step of 32: C += A @ B[32 * half .. 32 * half + 32), C split over Clo / Chi (bf16 buffers used as f32).
+void gemm_step(const bf16 *__restrict A, const bf16 *__restrict B, bf16 *__restrict Clo, bf16 *__restrict Chi,
+               int32_t half) {
+  event0();
+  const bf16 *const Bh[1] = {B + half * GA * ND4 * 32};
+  float *lo = reinterpret_cast<float *>(Clo);
+  float *hi = reinterpret_cast<float *>(Chi);
+  for (int i = 0; i < TQ; i += 2) {
+    float *Ci = i < TQ / 2 ? lo + i * ND4 * 32 : hi + (i - TQ / 2) * ND4 * 32;
+    const bf16 *const A0[1] = {A + i * GA * 64};
+    const bf16 *const A1[1] = {A + (i + 1) * GA * 64};
+    gemm_rowpair(A0, A1, Bh, Ci, Ci + ND4 * 32);
+  }
+  event1();
+}
+#endif
+
+void gemm_zero(bf16 *__restrict Clo, bf16 *__restrict Chi) {
+  event0();
+  zero_vectorized<float, BQ / 2, HD, false>(reinterpret_cast<float *>(Clo));
+  zero_vectorized<float, BQ / 2, HD, false>(reinterpret_cast<float *>(Chi));
+  event1();
+}
+
+void gemm_store(const bf16 *__restrict Clo, const bf16 *__restrict Chi, float *__restrict C) {
+  event0();
+  const float *lo = reinterpret_cast<const float *>(Clo);
+  const float *hi = reinterpret_cast<const float *>(Chi);
+  for (int i = 0; i < CHALF; i += 32)
+    aie::store_v(C + i, aie::load_v<32>(lo + i));
+  for (int i = 0; i < CHALF; i += 32)
+    aie::store_v(C + CHALF + i, aie::load_v<32>(hi + i));
+  event1();
+}
+
+// attn_round_init without Q (which now arrives through attn_q_strip): O = 0, m = -inf, l = 0.
+void attn_round_init_o(float *__restrict O, bf16 *__restrict m, float *__restrict l) {
+  event0();
+  zero_vectorized<float, BQ, HD, false>(O);
+  const aie::vector<bf16, 16> neg = aie::broadcast<bf16, 16>(kLowest);
+  const aie::vector<float, 16> zero = aie::zeros<float, 16>();
+  for (int i = 0; i < TQ * 8; i += 16) {
+    aie::store_v(m + i, neg);
+    aie::store_v(l + i, zero);
+  }
+  event1();
+}
+
+// Strip s (slab columns [16s, 16s + 16)) of the round's Q: the 8x8 tiles in it that belong to head `col` (this
+// core's column), scaled by the attention scale times log2(e) and rounded to bf16 into Qb.
+void attn_q_strip(const bf16 *__restrict Y, bf16 *__restrict Qb, int32_t s, int32_t col, int32_t q_scale_bits) {
+  event0();
+  float q_scale;
+  __builtin_memcpy(&q_scale, &q_scale_bits, sizeof q_scale);
+  const float *__restrict Yf = reinterpret_cast<const float *>(Y);
+  aie::rounding_mode saved_rounding = aie::swap_rounding(aie::rounding_mode::conv_even);
+  const int head0 = col * HD; // this core's head in the slab: columns [head0, head0 + HD)
+  for (int p = 0; p < 2; p++) {
+    const int c0 = 16 * s + 8 * p - head0; // column of the tile's first element in this core's head
+    if (c0 < 0 || c0 >= HD)
+      continue;
+    bf16 *__restrict q = Qb + (c0 >> 3) * 64;
+    for (int i = 0; i < TQ; i++) {
+      const V32f a = aie::load_v<32>(Yf + (i * 4 + 2 * p) * 32);
+      const V32f b = aie::load_v<32>(Yf + (i * 4 + 2 * p + 1) * 32);
+      const auto [r03, r47] = aie::interleave_zip(a, b, 4); // rows 0-3 and 4-7 of the 8x8 tile
+      Acc32f x0 = aie::mul(r03, q_scale);
+      Acc32f x1 = aie::mul(r47, q_scale);
+      aie::store_v(q + i * TD * 64, x0.template to_vector<bf16>());
+      aie::store_v(q + i * TD * 64 + 32, x1.template to_vector<bf16>());
+    }
+  }
+  aie::set_rounding(saved_rounding);
+  event1();
+}
+
+} // extern "C"
+#endif // UNIFIED

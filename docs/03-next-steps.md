@@ -39,17 +39,28 @@ object and returned as a zero-copy f32 view. The 32x32 call is 7.0-7.9 ms wall t
 SDPA enabled, the 32x32 level still by a thin margin (gate: 10 vs 11-12 ms), and the reason is now
 measured: the **NPU program switch**. GEMMs and attention are separate IRON programs that both use all
 four columns, so the firmware reconfigures the array whenever a dispatch of the other program follows,
-~2.5 ms each way (3d, `logs/11-attn-v10-ctxswitch.log`). Every attention layer in the UNet pays two of
-them, and the gate's NPU figure includes one. In order of expected payoff:
-- One NPU program for the GEMMs and the attention, so nothing is reconfigured between them: a single
-  IRON design whose cores branch on a runtime "mode" parameter and whose objectfifos serve both
-  dataflows. The core has 2 S2MM + 2 MM2S DMA channels and each design already uses 2 + 1, so the two
-  input streams must be shared (one fifo type sized for the larger object, the memtile distribution
-  pattern chosen per mode), which is a redesign of both; the payoff is ~5 ms per attention layer in
-  situ (~50 ms per SD1.5 UNet call) and a 32x32 gate figure of ~7.5 ms instead of 10. Cheaper variants
-  worth a try first: an xclbin that carries both PDIs in one hardware context (`xclbinutil` can merge
-  them) in case the firmware's PDI swap within a context is cheaper than a context switch; or
-  checking whether amdxdna exposes a context priority / residency knob.
+~2.5 ms each way (3d, `logs/11-attn-v10-ctxswitch.log`). Every attention layer in the UNet paid two of
+them, and the gate's NPU figure included one (fixed in 3e). In order of expected payoff:
+- Done (section 3e): one NPU program for the GEMMs and the attention (`npu/xdna1_program.py`), one per head
+  dimension because two attention kernels do not fit a core's 16 KB of program memory; GEMMs run on whichever
+  program ran last. A GEMM next to an attention block no longer reconfigures the array (32x32 attention after
+  a GEMM 9.3 -> 7.5 ms, GEMM after attention 2.5 -> 0.6 ms); a UNet call has 2 switches left (the 64x64 /
+  32x32 level changes) instead of ~20. What it left behind:
+  - Q now reaches the cores through the row broadcast, four cores' worth per core: +0.2 ms (32x32) / +0.5 ms
+    (64x64) per block. Converting round r+1's strips during round r (a second Qb, +5 KB) would hide it; d = 80
+    has the room, d = 40 (~60 of 64 KB used) does not without shrinking something else.
+  - Checked (3e, "GEMM K step"): the GEMM's C tile going through the registers every 32 of K costs nothing
+    measurable. K steps of 64 (`gemm_kx=2`, two Y and two X objects per `gemm_step`, Y depth 4) measured the same as
+    32 within noise, and the earlier 2048x2560x640 regression (5.2 -> 7.9 ms) was a noisy run: the same binary does
+    4.4 ms (whole_array 5.2) and the SD1.5 set 64-70 ms (whole_array 102). The option is in the code but off
+    (`GEMM_K64`). Long-K GEMMs are bound by the shim streams (~17 GB/s at 2048x2560x640), so the lever is bytes
+    per flop: taller C tiles (B is re-sent once per 4 * bq rows of A; bq = 64 at d = 80 would halve that, but
+    needs a 20 KB C tile the attention-sized buffers do not have) or int8 weights (below).
+  - Program memory is at 14.5 (d = 80, after the `gemm_step` rewrite) and 15.2 (d = 40) of 16 KB, so kernel
+    growth needs room first, d = 40 especially; `attn_round_finish` (1.8 KB, mostly the unrolled `bcast4_rows`)
+    is the obvious place.
+  - The last 2 switches per UNet call go away only with a runtime head dimension in the attention kernel
+    (one program for 40 and 80), which costs the compile-time unrolling the kernel's speed depends on.
 - What is left of the host side (section 3d's profile): the K and V copies into the interleaved
   bf16 buffer (0.3 ms each at 32x32, 0.6-1.2 at 64x64; the parts pipeline hides most of them), four
   cache-maintenance ioctls of ~0.1 ms each and the XRT submits (~0.1 ms each). A GEMM variant that

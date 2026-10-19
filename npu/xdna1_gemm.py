@@ -1,13 +1,15 @@
-"""bf16 GEMM (and attention matmuls) on the AMD XDNA1 (Phoenix, ``RyzenAI-npu1``) NPU for arbitrary shapes.
+"""bf16 GEMM (and attention) on the AMD XDNA1 (Phoenix, ``RyzenAI-npu1``) NPU for arbitrary shapes.
 
 C[M, N] (f32) = A[M, K] (bf16) @ B[K, N] (bf16) on all 16 compute cores (4 columns x 4 rows).
 
-Built on mlir-aie's ``whole_array`` matmul design (programming_examples/basic/matrix_multiplication/
-whole_array, Apache-2.0 WITH LLVM-exception), whose M, K and N are *dispatch-time* parameters: one
-compiled NPU program serves every shape, and each call only gets a small instruction stream generated
-on the host. Weights are uploaded once and stay resident in their own NPU buffer objects; shapes that
-do not meet the alignment (M % 128, K % 64, N % 128 for the 32x64x32 tile) are zero-padded, and large
-N / K are split into chunks.
+The GEMMs and the fused attention run in one NPU program (``npu/xdna1_program.py``; its dataflow is laid out
+like mlir-aie's ``whole_array`` matmul design), so a GEMM next to an attention block costs no reconfiguration
+of the array (~2.5 ms each way with two programs). A program holds the attention for one head dimension, so
+there is one per head dimension (SD1.5: 40 and 80); GEMMs run on whichever program ran last. M, K and N are
+*dispatch-time* parameters: each call only gets a small instruction stream generated on the host. Weights are
+uploaded once and stay resident in their own NPU buffer objects; shapes that do not meet the alignment of
+every program (M % 256, K % 64, N % 320 for SD1.5's two) are zero-padded, and large N / K are split into
+chunks.
 
 Host path (the part that used to cost as much as the NPU itself):
 
@@ -25,8 +27,8 @@ Host path (the part that used to cost as much as the NPU itself):
   the C bytes from the device after it) instead of through the IRON tensor's coherence tracking.
 
 Attention: ``attention()`` runs the whole block (all batch x head pairs) as a few fused NPU dispatches
-with the softmax on the compute cores (``npu/xdna1_attention.py``) whenever a compiled program exists
-for the head dimension and the shape meets its tiling (``NpuAttention.fits``). The NPU's DMAs gather
+with the softmax on the compute cores (``npu/xdna1_program.py``) whenever a compiled program exists
+for the head dimension and the shape meets its tiling (``NpuProgram.fits``). The NPU's DMAs gather
 the heads out of the model's own layouts: Q goes in as it is (in place when it is one of this runner's
 pinned GEMM outputs), K and V are converted to bf16 with one contiguous copy each, the f32 result comes
 back as a zero-copy pooled view like the GEMM outputs. Otherwise it falls back to
@@ -35,12 +37,13 @@ SDPA and only there for shapes the fused kernel does not take.
 """
 from __future__ import annotations
 
+import math
 import os
 import sys
 import threading
 import time
 import weakref
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import numpy as np
 import torch
@@ -51,25 +54,14 @@ _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 os.environ.setdefault("NPU_CACHE_HOME", os.path.join(_ROOT, "build", "npu-cache-iron"))
 
 import aie.iron as iron
-import aie.utils as _aie_utils
 from aie.iron import str_to_dtype
 from aie.iron.device import from_name
 
-_WA_DIR = os.path.join(_ROOT, "reference", "mlir-aie", "programming_examples", "basic", "matrix_multiplication", "whole_array")
-if _WA_DIR not in sys.path:
-    sys.path.insert(0, _WA_DIR)
-from whole_array import whole_array  # noqa: E402
-
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
-from npu.xdna1_attention import LOG2E, NpuAttention  # noqa: E402
-
-import pyxrt  # noqa: E402  (system python3-xrt, symlinked into the venv)
-from aie.utils.hostruntime.xrtruntime.tensor import XrtTransport  # noqa: E402
+from npu.xdna1_program import LOG2E, NpuProgram  # noqa: E402
 
 BF16 = str_to_dtype("bf16")
-ROWS = 4  # compute rows of the array; columns are a parameter
-_COMPLETED = pyxrt.ert_cmd_state.ERT_CMD_STATE_COMPLETED
 
 
 def _pad_up(x: int, a: int) -> int:
@@ -190,86 +182,93 @@ class _BufPool:
 
 
 class NpuGemm:
-    """Shape-agnostic bf16 GEMM runner. Default tile (m, k, n) = (32, 64, 32) on 4 columns -> align M%128, K%64, N%128."""
+    """Shape-agnostic bf16 GEMM and fused attention runner on one NPU program per attention head dimension."""
 
-    def __init__(self, m: int = 32, k: int = 64, n: int = 32, n_cols: int = 4,
-                 max_n_chunk: int = 4096, max_m_chunk: int = 4096, max_k_chunk: int = 8192, verbose: bool = True,
-                 attn_head_dims: tuple[int, ...] = (40, 80), attn_lazy_compile: bool = False):
-        """``attn_head_dims``: head dimensions the fused attention program is compiled for up front (SD1.5's
-        64x64 and 32x32 levels: 40 / 80; the 16x16 level's d = 160 build crashes Peano and the CPU wins there
-        anyway); other multiples of 8 compile on first use when ``attn_lazy_compile`` (the compile then lands
-        inside that call, which a timing gate would count against the NPU)."""
+    def __init__(self, n_cols: int = 4, max_n_chunk: int = 4096, max_m_chunk: int = 4096, max_k_chunk: int = 8192,
+                 verbose: bool = True, attn_head_dims: tuple[int, ...] = (40, 80), attn_lazy_compile: bool = False,
+                 gemm_head_dim: int = 80):
+        """``attn_head_dims``: head dimensions to compile a program for up front (SD1.5's 64x64 and 32x32 levels:
+        40 / 80; the 16x16 level's d = 160 does not fit a core next to the GEMM and the CPU wins there anyway).
+        Every program also runs the GEMMs, which go to whichever program ran last, so the array is reconfigured
+        only when consecutive attention blocks differ in head dimension. Without head dimensions one program,
+        for ``gemm_head_dim``, runs the GEMMs. Other head dimensions compile on first use when
+        ``attn_lazy_compile`` (the compile then lands inside that call, which a timing gate would count against
+        the NPU); their programs take GEMMs too when their tiling divides the runner's alignment."""
         iron.set_current_device(from_name("npu", n_cols=n_cols))
         self.verbose = verbose
         self.attn_lazy_compile = attn_lazy_compile
-        self.m, self.k, self.n, self.n_cols = m, k, n, n_cols
-        self.align_m, self.align_k, self.align_n = m * ROWS, k, n * n_cols
-        self.max_n_chunk = max(self.align_n, max_n_chunk - max_n_chunk % self.align_n)
-        self.max_m_chunk = max(self.align_m, max_m_chunk - max_m_chunk % self.align_m)
-        self.max_k_chunk = max(self.align_k, max_k_chunk - max_k_chunk % self.align_k)
+        self.n_cols = n_cols
         self.stats = {"calls": 0, "dispatches": 0, "npu_seconds": 0.0, "total_seconds": 0.0, "flops": 0.0,
                       "compile_seconds": 0.0, "buffers": 0, "buffer_bytes": 0, "alloc_seconds": 0.0,
+                      "program_switches": 0,   # dispatches that went to a different program than the one before
                       "attn_calls": 0, "attn_pairs": 0, "attn_seconds": 0.0, "attn_flops": 0.0,
                       "attn_fused_calls": 0, "attn_fused_npu_seconds": 0.0, "attn_fused_seconds": 0.0,
                       "attn_fused_q_inplace": 0, "attn_t_convert": 0.0, "attn_t_submit": 0.0, "attn_t_wait": 0.0,
                       "attn_t_sync_out": 0.0, "attn_by_shape": {},   # (b, tq, tk, h, d) -> [blocks, convert, submit, wait, sync, in place, wall]
                       "attn_fused_flops": 0.0, "attn_compile_seconds": 0.0}
         self.pool = _BufPool(self.stats)
-        self._insts: dict[tuple[int, int, int], tuple[object, object, int]] = {}
         self._lock = threading.RLock()
-        # Compile the program once. The dispatch bridge bounds-checks every call against the host buffer
-        # sizes the program was compiled with, so compile against the largest chunk buffers this runner
-        # will ever dispatch (the real per-call buffers may be smaller; padding keeps accesses inside them).
+        # One program per head dimension, compiled (or loaded from the cache) now. The dispatch bridge bounds-checks
+        # every call against the buffer sizes a program was compiled with; NpuProgram's defaults (2^25 bf16 inputs,
+        # 2^24 f32 outputs) cover the largest chunks below.
         t0 = time.perf_counter()
-        A_max, B_max, C_max = (self.max_m_chunk * self.max_k_chunk, self.max_k_chunk * self.max_n_chunk,
-                               self.max_m_chunk * self.max_n_chunk)
-        self.design = whole_array.specialize(
-            A=np.ndarray[(A_max,), np.dtype[BF16]], B=np.ndarray[(B_max,), np.dtype[BF16]],
-            C=np.ndarray[(C_max,), np.dtype[np.float32]],
-            m=m, k=k, n=n, n_aie_cols=n_cols, b_col_maj=0, c_col_maj=0,
-            emulate_bf16_mmul_with_bfp16=False, use_chess=False, scalar=False)
-        a0 = iron.zeros((A_max,), dtype=BF16, device="npu")
-        b0 = iron.zeros((B_max,), dtype=BF16, device="npu")
-        c0 = iron.zeros((C_max,), dtype=np.float32, device="npu")
-        self.design(a0, b0, c0, M=self.align_m, K=self.align_k, N=self.align_n)  # compile + warm-up run
-        del a0, b0, c0
-        kernels = list(getattr(self.design, "_kernel_cache", {}).values())
-        if not kernels:
-            raise RuntimeError("whole_array design did not cache its compiled kernel; cannot dispatch directly")
-        self.kernel = kernels[0]
-        self.rt = _aie_utils.DefaultNPURuntime
-        self._handle = self.rt.load(self.kernel)  # cached XRT hw context + kernel for our xclbin
+        self.progs: dict[int, NpuProgram | None] = {}
+        for d in attn_head_dims or (gemm_head_dim,):
+            self.progs[d] = NpuProgram(d, n_cols=n_cols, verbose=verbose)
+        self.gemm_progs = [p for p in self.progs.values() if p is not None]
+        # Buffers and weights are padded for every program, so each can run every GEMM.
+        self.align_m = math.lcm(*(p.align_m for p in self.gemm_progs))
+        self.align_k = math.lcm(*(p.align_k for p in self.gemm_progs))
+        self.align_n = math.lcm(*(p.align_n for p in self.gemm_progs))
+        self.max_n_chunk = max(self.align_n, max_n_chunk - max_n_chunk % self.align_n)
+        self.max_m_chunk = max(self.align_m, max_m_chunk - max_m_chunk % self.align_m)
+        self.max_k_chunk = max(self.align_k, max_k_chunk - max_k_chunk % self.align_k)
+        for p in self.gemm_progs:
+            if not p.gemm_fits(self.max_m_chunk, self.max_k_chunk, self.max_n_chunk):
+                raise ValueError(f"GEMM chunks {self.max_m_chunk}x{self.max_k_chunk}x{self.max_n_chunk} exceed the "
+                                 f"buffers the d={p.hd} program was compiled for")
+        self.cur = self.gemm_progs[-1]   # the program the last dispatch went to
         self.stats["compile_seconds"] = time.perf_counter() - t0
         if verbose:
-            print(f"[xdna1_gemm] program ready in {self.stats['compile_seconds']:.1f}s "
-                  f"(tile {m}x{k}x{n}, {n_cols} columns, align M%{self.align_m} K%{self.align_k} N%{self.align_n})",
-                  flush=True)
-        self.attn_progs: dict[int, NpuAttention] = {}
+            print(f"[xdna1_gemm] {len(self.gemm_progs)} program(s) (head dims {sorted(self.progs)}) ready in "
+                  f"{self.stats['compile_seconds']:.1f}s; GEMM align M%{self.align_m} K%{self.align_k} "
+                  f"N%{self.align_n}", flush=True)
         self._attn_warm: set[tuple[int, int, int, int]] = set()
         self.attn_parts = 2         # dispatches per fused attention block (the host work of part i+1 overlaps part i)
         self.attn_first_pairs = 0   # pairs in an extra small leading dispatch (0: none); see _attention_fused
-        for d in attn_head_dims:
-            self._attn_prog(d, compile_ok=True)
 
-    def _attn_prog(self, d: int, compile_ok: bool | None = None) -> NpuAttention | None:
-        """The fused attention program for head dim ``d`` (compiled on demand when allowed), else None."""
-        prog = self.attn_progs.get(d)
-        if prog is not None or d % 8 or d > 256:
-            return prog
+    def _attn_prog(self, d: int, compile_ok: bool | None = None) -> NpuProgram | None:
+        """The program for head dim ``d`` (compiled on demand when allowed), else None."""
+        if d in self.progs or d % 8 or d > 256:
+            return self.progs.get(d)
         if compile_ok is None:
             compile_ok = self.attn_lazy_compile
         if not compile_ok:
             return None
         t0 = time.perf_counter()
         try:
-            prog = NpuAttention(d, n_cols=self.n_cols, verbose=self.verbose)
+            prog = NpuProgram(d, n_cols=self.n_cols, verbose=self.verbose)
         except Exception as e:  # a tiling that does not fit the core, an unsupported d: fall back, once
             if self.verbose:
-                print(f"[xdna1_gemm] fused attention program for d={d} unavailable: {e}", flush=True)
+                print(f"[xdna1_gemm] program for d={d} unavailable: {e}", flush=True)
             prog = None
-        self.attn_progs[d] = prog
+        self.progs[d] = prog
+        if prog is not None and all(a % b == 0 for a, b in ((self.align_m, prog.align_m), (self.align_k, prog.align_k),
+                                                           (self.align_n, prog.align_n))):
+            self.gemm_progs.append(prog)
         self.stats["attn_compile_seconds"] += time.perf_counter() - t0
         return prog
+
+    def _use(self, prog: NpuProgram) -> NpuProgram:
+        """Note a dispatch to ``prog`` (a different program than the last one reconfigures the array)."""
+        if prog is not self.cur:
+            self.stats["program_switches"] += 1
+            self.cur = prog
+        return prog
+
+    def _gemm_prog(self) -> NpuProgram:
+        """The program for the next GEMM: the one that ran last, so the array stays as it is configured."""
+        return self.cur if self.cur in self.gemm_progs else self.gemm_progs[-1]
 
     # -- shapes -------------------------------------------------------------------------------
     def _m_chunks(self, M: int):
@@ -301,7 +300,8 @@ class NpuGemm:
         """Generate the instruction streams and pre-allocate buffers for these logical (M, K, N) shapes."""
         for M, K, N in shapes:
             for Mc, Kc, Nc in self.dispatch_shapes(M, K, N):
-                self._insts_for(Mc, Kc, Nc)
+                for prog in self.gemm_progs:
+                    prog._insts_for(prog.gemm_params(Mc, Kc, Nc))
             Mp = _pad_up(M, self.align_m)
             self.pool.lease(("A", Mp, K), Mp, _pad_up(K, self.align_k), torch.bfloat16).release()
             for n0, n1, Nc in self._n_chunks(N):
@@ -321,31 +321,12 @@ class NpuGemm:
         return NpuWeight(K=K, N=N, Kp=_pad_up(K, self.align_k), chunks=chunks)
 
     # -- dispatch -----------------------------------------------------------------------------
-    def _insts_for(self, Mc: int, Kc: int, Nc: int):
-        key = (Mc, Kc, Nc)
-        ent = self._insts.get(key)
-        if ent is None:
-            words = self.kernel._generate_dispatch_insts({"M": Mc, "K": Kc, "N": Nc})
-            store = XrtTransport(self.rt._device, words.nbytes, pyxrt.bo.cacheable, self._handle.kernel.group_id(1))
-            store.host_bytes[:] = words.view(np.uint8).reshape(-1)
-            store.to_device(0, words.nbytes)
-            ent = (store, store.handle(0, words.nbytes), words.nbytes)
-            self._insts[key] = ent
-        return ent
-
     def _submit(self, a_bo, b_bo, c_bo, Mc: int, Kc: int, Nc: int):
         """Start one GEMM dispatch (non-blocking). Returns the pyxrt run handle to pass to _wait."""
-        if not getattr(self._handle, "_is_valid", True):
-            self._handle = self.rt.load(self.kernel)
-        _, insts_bo, nbytes = self._insts_for(Mc, Kc, Nc)
         self.stats["dispatches"] += 1
-        return self._handle.kernel(3, insts_bo, nbytes, a_bo, b_bo, c_bo)
+        return self._use(self._gemm_prog()).submit_gemm(a_bo, b_bo, c_bo, Mc, Kc, Nc)
 
-    @staticmethod
-    def _wait(run) -> None:
-        r = run.wait()
-        if r != _COMPLETED:
-            raise RuntimeError(f"NPU GEMM dispatch failed: kernel returned {r}")
+    _wait = staticmethod(NpuProgram.wait)
 
     def _run(self, a_t, b_t, c_t, M: int, K: int, N: int) -> None:
         """Blocking single dispatch on whole IRON tensors (A/B synced to the device first; read C with .numpy())."""
@@ -523,7 +504,7 @@ class NpuGemm:
         f32 (or (b, heads, tq, d) when skip_output_reshape).
 
         Fused path (a few dispatches per block, softmax on the cores): used when a program exists for ``d`` and
-        the shape fits its tiling, see ``NpuAttention.fits``. Otherwise the per-head path: for every
+        the shape fits its tiling, see ``NpuProgram.fits``. Otherwise the per-head path: for every
         (batch, head) pair Q K^T on the NPU, softmax on the CPU in f32 written as bf16 into the next
         matmul's input buffer, P V on the NPU; heads are pipelined (the NPU computes Q K^T of head i+1 and
         P V of head i-1 while the CPU does the softmax of head i).
@@ -618,14 +599,15 @@ class NpuGemm:
             self.stats["attn_seconds"] += time.perf_counter() - t_start
         return out
 
-    def _attention_fused(self, prog: NpuAttention, q, k, v, b, h, tq, tk, d, scale, skip_reshape, skip_output_reshape,
+    def _attention_fused(self, prog: NpuProgram, q, k, v, b, h, tq, tk, d, scale, skip_reshape, skip_output_reshape,
                          t_start) -> torch.Tensor:
         """One or two NPU dispatches for the block, with the heads gathered and scattered by the NPU's DMAs.
 
         Q goes to the NPU as f32 in its own layout: when it is a view of one of this runner's pinned buffers (the
-        NPU GEMM outputs are, padded row stride and all) it is used in place, otherwise it is copied once into a
-        pinned f32 buffer; the cores scale it by scale * log2(e) (the kernel's weights are 2^(S - m)) and round
-        it to bf16. The host converts K and V with one contiguous copy each into a pinned bf16 buffer with the
+        NPU GEMM outputs are, padded row stride and all) with a multiple of 4 heads per row (the program's four
+        columns take four adjacent heads at a time) it is used in place, otherwise it is copied once into a pinned
+        f32 buffer, as (b*h/4, tq, 4*d) when the heads per row are not a multiple of 4 (head-major input); the
+        cores scale it by scale * log2(e) (the kernel's weights are 2^(S - m)) and round it to bf16. The host converts K and V with one contiguous copy each into a pinned bf16 buffer with the
         K and V blocks of bk rows alternating, (b, tk/bk, 2, bk, h*d). The shim DMAs pick each (batch, head)
         pair's (rows x d) block out of those at the row stride and scatter the f32 result the same way into a
         pooled pinned (b, tq, h*d) buffer, returned as a zero-copy torch view (back to the pool when the view
@@ -672,9 +654,10 @@ class NpuGemm:
                 outb = pool.lease(("AOUT", b, tq, h * d), b * tq, h * d, torch.float32)
                 out = self._output_view(outb, b * tq, h * d).view(b, tq, h * d)
             # Q in place when it already lives in one of our pinned buffers as a (nb, tq, >= hi*d) f32 view with
-            # rows at a uniform stride (the GEMM outputs), else copied once into a pinned f32 buffer.
-            qb, qoff, ldq, q_owned = None, 0, hi * d, False
-            if (qn.dtype == torch.float32 and qn.stride(2) == 1 and qn.stride(1) >= hi * d
+            # rows at a uniform stride (the GEMM outputs) and hi % 4 == 0, else copied once into a pinned f32 buffer
+            # with hq heads per row.
+            qb, qoff, ldq, hq, q_owned = None, 0, hi * d, hi, False
+            if (hi % nc == 0 and qn.dtype == torch.float32 and qn.stride(2) == 1 and qn.stride(1) >= hi * d
                     and (nb == 1 or qn.stride(0) == tq * qn.stride(1))):
                 found = pool.find(qn.data_ptr())
                 if found is not None:
@@ -682,14 +665,18 @@ class NpuGemm:
                     last = off + ((nb - 1) * tq * qn.stride(1) + (tq - 1) * qn.stride(1) + hi * d) * 4
                     if off % 4 == 0 and last <= buf.nbytes:
                         qb, qoff, ldq = buf, off // 4, qn.stride(1)
+            q_src = None
             if qb is None:
                 qb, q_owned = pool.lease(("AQF", bh, tq, d), bh * tq, d, torch.float32), True
-                qv = qb.t2d.view(nb, tq, hi * d)
+                hq = hi if hi % nc == 0 else nc
+                ldq = hq * d
+                qv = qb.t2d.view(bh // hq, tq, hq * d)
             q_batch = tq * ldq * 4
             kvb = pool.lease(("AKV", bh, tk, d), bh * tk * 2, d, torch.bfloat16)
             kvv = kvb.t2d.view(nb, nkb, 2, bk, hi * d)
 
             def convert_in(part):
+                nonlocal q_src
                 p0, n = part
                 # The whole batches of the range in one copy, a partial first / last batch as a head (column) range.
                 pieces, whole = [], []
@@ -701,8 +688,13 @@ class NpuGemm:
                         pieces.append((bi, slice(lo * d, up * d)))
                 if whole:
                     pieces.append((slice(whole[0], whole[-1] + 1), slice(None)))
+                if q_owned and hq != hi:   # (pairs, tq, d) -> groups of 4 pairs side by side
+                    if q_src is None:
+                        q_src = qn if hi == 1 else qn.view(nb, tq, hi, d).transpose(1, 2).reshape(bh, tq, d)
+                    qv[p0 // hq:(p0 + n) // hq].view(n // hq, tq, hq, d).copy_(
+                        q_src[p0:p0 + n].view(n // hq, hq, tq, d).transpose(1, 2))
                 for bs, cs in pieces:
-                    if q_owned:
+                    if q_owned and hq == hi:
                         qv[bs, :, cs].copy_(qn[bs, :, cs])
                     kk, vv = kn[bs, :, cs], vn[bs, :, cs]
                     kvv[bs, :, 0, :, cs].copy_(kk.reshape(*kk.shape[:-2], nkb, bk, kk.shape[-1]))
@@ -711,15 +703,17 @@ class NpuGemm:
                 # out (torch's version counter is still 0) holds no dirty lines: the NPU wrote it, the CPU only
                 # read. Inference tensors (ComfyUI runs under inference_mode) keep no counter: always flushed.
                 if q_owned or qn.is_inference() or qn._version != 0:
-                    q0, qn_ = span(p0, n, hi, q_batch)
+                    q0, qn_ = span(p0, n, hq, q_batch)
                     qb.to_device(qoff * 4 + q0, min(qn_, qb.nbytes - qoff * 4 - q0))
                 kvb.to_device(*span(p0, n, hi, kv_batch))
                 outb.to_device(*span(p0, n, ho, o_batch))  # drop the CPU's dirty lines before the NPU writes
 
+            q_bo = qb.bo(qoff * 4, qb.nbytes - qoff * 4)   # Q's offset in its buffer as a sub-buffer
+
             def submit(part):
                 p0, n = part
-                return prog.submit(qb.bo(), kvb.bo(), outb.bo(), tq, tk, n, hi, ho, p0, ldq=ldq, qoff=qoff,
-                                   q_scale=scale * LOG2E)
+                return self._use(prog).submit_attn(q_bo, kvb.bo(), outb.bo(), tq, tk, n, hq, hi, ho, p0, ldq=ldq,
+                                                   q_scale=scale * LOG2E)
 
             st = self.stats
             sh = st["attn_by_shape"].setdefault((b, tq, tk, h, d), [0, 0.0, 0.0, 0.0, 0.0, 0, 0.0])
@@ -762,7 +756,8 @@ class NpuGemm:
         s = self.stats
         gf = s["flops"] / s["npu_seconds"] / 1e9 if s["npu_seconds"] else 0.0
         msg = (f"NpuGemm: {s['calls']} calls, {s['dispatches']} dispatches, NPU {s['npu_seconds']:.3f}s, "
-               f"wall {s['total_seconds']:.3f}s, {gf:.0f} GFLOPS (NPU time), program compile {s['compile_seconds']:.1f}s, "
+               f"wall {s['total_seconds']:.3f}s, {gf:.0f} GFLOPS (NPU time), {s['program_switches']} program switches, "
+               f"program compile {s['compile_seconds']:.1f}s, "
                f"{s['buffers']} pinned buffers ({s['buffer_bytes'] / 2**20:.0f} MiB, {s['alloc_seconds']:.2f}s to allocate)")
         if s["attn_fused_calls"]:
             msg += (f"; fused attention: {s['attn_fused_calls']} blocks, NPU {s['attn_fused_npu_seconds']:.3f}s, "

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fused NPU attention (npu/xdna1_attention.py) vs torch SDPA: correctness and per-block time.
+"""Fused NPU attention (the attention mode of npu/xdna1_program.py) vs torch SDPA: correctness and per-block time.
 
     docker/run.sh python3 scripts/11-attn-fused-test.py                 # default shapes (SD1.5 512x512 self-attention)
     docker/run.sh python3 scripts/11-attn-fused-test.py --shapes 1x4x256x256x40 2x8x4096x4096x40 --iters 5
@@ -7,6 +7,8 @@
     docker/run.sh python3 scripts/11-attn-fused-test.py --gemm            # go through NpuGemm.attention() (the ComfyUI path)
     docker/run.sh python3 scripts/11-attn-fused-test.py --gemm --warmup --pinned   # ... with the gate's warm-up and q/k/v as
                                                                            # padded views of pinned buffers (NPU GEMM outputs)
+    docker/run.sh python3 scripts/11-attn-fused-test.py --gemm --interleave     # a GEMM dispatch before every attention call,
+                                                                           # as in a UNet (no program switch any more)
 
 Shapes are b x heads x tq x tk x d. For every shape the NPU result is compared with SDPA in f32 on the
 same inputs (max |err| / max |ref|, the gate's metric, plus the same number for SDPA run on bf16-rounded
@@ -27,7 +29,7 @@ import torch.nn.functional as F
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, ROOT)
 
-from npu.xdna1_attention import BF16, LOG2E, ROWS, NpuAttention  # noqa: E402
+from npu.xdna1_program import BF16, LOG2E, NpuProgram  # noqa: E402
 
 import aie.iron as iron  # noqa: E402
 
@@ -63,6 +65,9 @@ def main():
     ap.add_argument("--warmup", action="store_true", help="--gemm: call attention_fits(.., bh) first, as the ComfyUI node does")
     ap.add_argument("--strided", action="store_true",
                     help="hand q/k/v over as views with a padded row stride (as ComfyUI does with the NPU GEMM outputs)")
+    ap.add_argument("--interleave", action="store_true",
+                    help="--gemm: run a 256x640x640 GEMM before every timed attention call (only the attention is timed), "
+                         "the order of a UNet's Linear and attention layers")
     ap.add_argument("--pinned", action="store_true",
                     help="--gemm: hand q/k/v over as padded-stride views of the runner's own pinned buffers, exactly what "
                          "ComfyUI's NPU Linear layers produce (Q then goes to the NPU in place, without a copy)")
@@ -71,13 +76,15 @@ def main():
     shapes = [parse_shape(s) for s in args.shapes]
 
     gemm = None
-    progs: dict[int, NpuAttention] = {}
+    progs: dict[int, NpuProgram] = {}
     if args.gemm:
         from npu.xdna1_gemm import NpuGemm
         gemm = NpuGemm(attn_head_dims=tuple(sorted({d for *_, d in shapes})))
+        if args.interleave:
+            w_il, x_il = gemm.upload_weight(torch.randn(640, 640) * 0.05), torch.randn(256, 640)
     else:
         for d in sorted({d for *_, d in shapes}):
-            progs[d] = NpuAttention(d, bq=args.bq, bk=args.bk, kv_depth=args.kv_depth, rescale_threshold=args.threshold,
+            progs[d] = NpuProgram(d, bq=args.bq, bk=args.bk, kv_depth=args.kv_depth, rescale_threshold=args.threshold,
                                     extra_flags=args.flags)
 
     print(f"load avg {os.getloadavg()[0]:.1f}, torch threads {torch.get_num_threads()}")
@@ -119,17 +126,24 @@ def main():
             out = gemm.attention(q, k, v, h)
             first_ms = (time.perf_counter() - t0) * 1e3
             err = rel_err(out, ref)
-            t0 = time.perf_counter()
+            npu_ms = 0.0
+            sw0 = gemm.stats["program_switches"]
             for _ in range(args.iters):
+                if args.interleave:
+                    float(gemm.matmul_t(x_il, w_il)[0, 0])
+                t0 = time.perf_counter()
                 out = gemm.attention(q, k, v, h)
-            npu_ms = (time.perf_counter() - t0) / args.iters * 1e3
+                npu_ms += time.perf_counter() - t0
+            npu_ms = npu_ms / args.iters * 1e3
             host_ms = float("nan")
-            print(f"{label}: first call {first_ms:.1f} ms ({'after' if args.warmup else 'no'} warm-up)")
+            print(f"{label}: first call {first_ms:.1f} ms ({'after' if args.warmup else 'no'} warm-up); "
+                  f"{gemm.stats['program_switches'] - sw0} program switches in {args.iters} timed calls"
+                  + (" with a GEMM before each" if args.interleave else ""))
             for buf in pinned:
                 buf.release()
         else:
             att = progs[d]
-            if not att.fits(tq, tk, bh, d):
+            if not att.fits(tq, tk, bh, d) or h % 4:
                 print(f"{label}: does not fit the fused program (bq={att.bq}, bk={att.bk}); skipped")
                 continue
             bk = att.bk
@@ -159,7 +173,7 @@ def main():
             host_in()
             t_in = time.perf_counter() - t0
             def dispatch():
-                att.wait(att.submit(Qt.buffer_object(), KVt.buffer_object(), Ot.buffer_object(), tq, tk, bh, h,
+                att.wait(att.submit_attn(Qt.buffer_object(), KVt.buffer_object(), Ot.buffer_object(), tq, tk, bh, h, h, h,
                                     q_scale=scale * q_scale))
 
             dispatch()

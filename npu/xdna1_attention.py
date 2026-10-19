@@ -1,5 +1,9 @@
 """Fused scaled-dot-product attention on the AMD XDNA1 NPU (one dispatch per attention block).
 
+The standalone attention program. ``NpuGemm`` no longer uses it: it runs the same kernel in the attention mode
+of ``npu/xdna1_program.py``, one program for GEMMs and attention, so the NPU is not reconfigured between them.
+This module is kept for A/B measurements against that program.
+
 ``out[b, :, h*d:(h+1)*d] = softmax(Q_bh K_bh^T * scale) V_bh`` for every (batch, head) pair of a block in one
 NPU dispatch, with the softmax on the compute cores (flash attention with an online softmax): the
 score matrix never exists outside a core's 2 KB scratch.

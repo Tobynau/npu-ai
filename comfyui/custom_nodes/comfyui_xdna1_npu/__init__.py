@@ -214,7 +214,14 @@ def _npu_attention_override(func, q, k, v, heads, mask=None, attn_precision=None
     if decision is None:
         # First NPU run of this shape in this mode: time it and, once per shape, check it against the CPU kernel
         # (bf16 inputs/probabilities vs the CPU's f32 path, so ~1e-2 relative is expected; more means a real bug).
+        # The first call of a head dimension usually also loads its NPU program (~2.5 ms, once per UNet level, not
+        # per call): time a second call then, so the gate compares steady states (dropping the first result
+        # first, so its pooled output buffer is reused rather than a new one allocated inside the timing).
+        switches = rt.gemm.stats["program_switches"]
         y = npu()
+        if rt.gemm.stats["program_switches"] != switches:
+            y = None
+            y = npu()
         if key not in gate.max_err or key not in gate.cpu_ms:
             t0 = time.perf_counter()
             ref = cpu()
