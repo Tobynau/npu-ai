@@ -900,6 +900,8 @@ ggml-xdna1 (INT8 prefill GEMMs on 4 hardware contexts) with 6 CPU threads.
 | Qwen2.5-0.5B | CPU 6 threads | 266.3 | 288.2 | 59.1 |
 | Qwen2.5-0.5B | CPU 12 threads | 212.9 | 178.5 | 10.9 |
 | Qwen2.5-0.5B | NPU + CPU 6 threads | 294.5 (1.11x) | 311.3 (1.08x) | 60.5 |
+| Qwen2.5-1.5B | **iGPU (Vulkan, -ngl 99)** | **800.4** | **918.9** (3.7x the NPU row) | **67.4** |
+| Qwen2.5-0.5B | **iGPU (Vulkan, -ngl 99)** | 2443 +- 330 | **3218** | **134.9** |
 
 Reading: the NPU helps prompt processing most where the GEMMs are large (1.5B: +68%); on the
 0.5B model the gate declines most shapes as too small to beat the CPU. Decode is unchanged by
@@ -910,9 +912,29 @@ Sanity generation (llama-completion, Qwen2.5-1.5B, greedy, plugin active):
 "An NPU is a neural network processor designed to accelerate machine learning tasks, and it is
 power efficient because it is optimized for specific hardware architectures ..." at 24.8 tok/s decode.
 
-For scale, the Radeon 760M iGPU would be the fastest local option for LLMs on this laptop
-(community numbers for the same model class: ~34 tok/s decode on a 3B); the point of the NPU is
-not to beat it but to run at a few watts and leave CPU/GPU free.
+The iGPU rows (`scripts/09-igpu-vulkan-bench.sh`, `logs/09-igpu-vulkan.log`, load 0.7-1.2, RADV
+Phoenix) settle it: the Radeon 760M is the fastest local option on both halves. Prompt processing is
+3.7x the NPU+CPU row and 6.2x the CPU on the 1.5B model, so handing prefill to the NPU and decode to
+the iGPU would only slow the prefill down. Decode is 2.2x the CPU: 935 MiB of weights per token at
+67.4 tok/s is ~66 GB/s of effective weight streaming (the 0.5B model, 374 MiB at 135 tok/s, reaches
+~53 GB/s; at that size per-token overheads start to show). The point of the NPU is not to beat it but
+to run at a few watts and leave the CPU/GPU free.
+
+### 4a. Memory bandwidth (`scripts/13-mem-bandwidth.py`, `logs/13-mem-bandwidth.log`)
+
+Same DRAM, different paths into it. torch on 1 GiB fp32 buffers (iGPU via the ROCm torch of the
+`~/ComfyUI` install through the `build/igpu-scratch/venv312` shim, CPU with 6 threads), load 0.7-0.8:
+
+| | Read (sum) | Copy (read+write) | Write (fill) |
+|---|---:|---:|---:|
+| iGPU (760M) | 73-85 GB/s (median varies 58-83 between runs) | 64-65 GB/s | 54-82 GB/s |
+| CPU, 6 threads | 58-59 GB/s | 37 GB/s | 27 GB/s |
+| NPU (shim DMA, from 2c and 3e) | ~13-20 GB/s effective | | |
+
+The iGPU's decode rate above (~66 GB/s of weights) sits right at its measured copy/read bandwidth, so
+llama.cpp decode on Vulkan is bandwidth-bound as expected. The NPU reaches a quarter or less of the
+same DRAM: the limit is its shim DMA channels and how much they keep in flight, not the memory.
+
 
 ## 5. The real alternative: the Radeon 760M iGPU (`scripts/12-comfy-igpu-test.sh`)
 
