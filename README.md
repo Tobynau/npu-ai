@@ -15,12 +15,14 @@ Tested on: Ryzen 5 7640U (Radeon 760M iGPU, 4x4 AIE2 NPU), 32 GB, Ubuntu 26.04, 
   19 tok/s, Qwen3-0.6B at 9 tok/s) and speeds up llama.cpp prompt processing 1.7x on a 1.5B model.
   Token generation is memory-bandwidth-bound and does not get faster. The **iGPU beats both**: 3.7x the
   NPU's prompt processing and 2.2x the CPU's decode on the same 1.5B model, because it reaches ~65-85 GB/s
-  of the shared DRAM where the NPU's shim DMAs reach ~13-20 GB/s.
+  of the shared DRAM where the NPU's shim DMAs reach ~13-20 GB/s. On models this small the CPU decodes
+  fastest of all (SmolLM2-135M: 236 tok/s CPU, 217 iGPU, 57 NPU); the NPU's case is watts, not speed.
 - **Image generation (SD1.5, ComfyUI):** the custom node here moves the Linear layers and attention
   onto the NPU and gets ~13-22% over the CPU. The **iGPU is ~4.5x faster still and uses ~3.5x less
   energy per image**. For images, use the iGPU.
 - **New bits:** a ComfyUI node for XDNA1 on Linux, a fused attention kernel (one NPU dispatch per
-  attention block, softmax on the AIE cores, 2-3x faster than torch SDPA on the CPU), a reusable bf16
+  attention block, softmax on the AIE cores, 2-3x faster than torch SDPA on the CPU, ~1.6x slower than
+  the iGPU), a reusable bf16
   GEMM module, and a driver patch that makes GNOME Resources show real NPU usage.
 
 ## Results
@@ -29,11 +31,11 @@ Tested on: Ryzen 5 7640U (Radeon 760M iGPU, 4x4 AIE2 NPU), 32 GB, Ubuntu 26.04, 
 |---|---:|---:|---:|
 | SD1.5 512x512, 4 steps, per image | 22.4 s / 654 J | 19.5 s / 554 J (CPU+NPU) | **4.0-4.5 s / ~150 J** |
 | Qwen2.5-1.5B Q4_K_M prompt processing (llama.cpp, pp512) | 149 tok/s | 250 tok/s (ggml-xdna1) | **919 tok/s** (Vulkan) |
-| Qwen2.5-1.5B Q4_K_M decode (llama.cpp, tg32) | 31 tok/s | - (prefill only) | **67 tok/s** (Vulkan) |
-| SmolLM2-135M decode | - | 57 tok/s (hawkpoint-npu-llm) | - |
+| Qwen2.5-1.5B Q4_K_M decode (llama.cpp, tg32) | 31 tok/s | 26 tok/s (ggml-xdna1 loaded; it leaves decode on the CPU) | **67 tok/s** (Vulkan) |
+| SmolLM2-135M decode (CPU/iGPU: llama.cpp Q8_0, tg32) | **236 tok/s** | 57 tok/s (hawkpoint-npu-llm, int8 weights) | 217 tok/s (Vulkan) |
 | Qwen2.5-0.5B decode | 119 tok/s (Ollama) | 19 tok/s (hawkpoint-npu-llm) | **135 tok/s** (Vulkan, llama-bench tg32) |
 | DRAM bandwidth reached | ~59 GB/s read (6 cores) | ~13-20 GB/s (shim DMA) | **~65-85 GB/s** |
-| SD1.5 64x64 self-attention block | 105-160 ms (torch SDPA) | **43 ms** (fused kernel) | - |
+| SD1.5 64x64 self-attention block | 105-160 ms (torch SDPA) | 43 ms (fused kernel) | **27 ms** (torch SDPA, fp16) |
 
 Energy is the SoC package counter (RAPL), which covers the cores, iGPU and NPU together. Full tables,
 methods and the dead ends are in [docs/02-results.md](docs/02-results.md).

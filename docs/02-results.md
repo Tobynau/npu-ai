@@ -912,6 +912,19 @@ Sanity generation (llama-completion, Qwen2.5-1.5B, greedy, plugin active):
 "An NPU is a neural network processor designed to accelerate machine learning tasks, and it is
 power efficient because it is optimized for specific hardware architectures ..." at 24.8 tok/s decode.
 
+SmolLM2-135M-Instruct, converted locally to a Q8_0 GGUF (int8 weights, the closest match to the
+hawkpoint engine's w8a16) with `convert_hf_to_gguf.py --outtype q8_0` from
+`models/hawkpoint/sources/SmolLM2-135M-Instruct` (`logs/14-smollm-cpu-igpu.log`, load 1.0-1.4):
+
+| Model | Config | pp128 tok/s | pp512 tok/s | tg32 tok/s |
+|---|---|---:|---:|---:|
+| SmolLM2-135M Q8_0 | **CPU 6 threads** | 2104 | 1944 +- 229 | **235.9** |
+| SmolLM2-135M Q8_0 | iGPU (Vulkan, -ngl 99) | 3587 +- 483 | **5397** | 217.2 |
+
+The NPU engine (section 2c, w8a16) does 56.8 tok/s decode and ~67 tok/s prefill on a 31-token prompt;
+its fixed 64-token context rules out pp128/pp512. At 136 MiB per token the model is too small to be bandwidth-bound anywhere; the CPU's lower per-token
+overhead beats the iGPU's kernel launches, and both are ~4x the NPU engine.
+
 The iGPU rows (`scripts/09-igpu-vulkan-bench.sh`, `logs/09-igpu-vulkan.log`, load 0.7-1.2, RADV
 Phoenix) settle it: the Radeon 760M is the fastest local option on both halves. Prompt processing is
 3.7x the NPU+CPU row and 6.2x the CPU on the 1.5B model, so handing prefill to the NPU and decode to
@@ -919,6 +932,18 @@ the iGPU would only slow the prefill down. Decode is 2.2x the CPU: 935 MiB of we
 67.4 tok/s is ~66 GB/s of effective weight streaming (the 0.5B model, 374 MiB at 135 tok/s, reaches
 ~53 GB/s; at that size per-token overheads start to show). The point of the NPU is not to beat it but
 to run at a few watts and leave the CPU/GPU free.
+
+### 4b. SD1.5 attention blocks on the iGPU (`scripts/15-attn-igpu.py`, `logs/15-attn-igpu.log`)
+
+torch SDPA in fp16 on the 760M (ROCm torch through the same shim venv), 20 runs, same shapes as 3d/3e:
+
+| Shape (b x h x tq x tk x d) | CPU (torch SDPA, f32) | NPU (fused kernel, 3e) | iGPU (SDPA, fp16) |
+|---|---:|---:|---:|
+| 2x8x4096x4096x40 (64x64 level) | 105-160 ms | 43 ms | **26.6 ms** (max abs err 7e-5 vs f32) |
+| 2x8x1024x1024x80 (32x32 level) | 13-18 ms | 6.3 ms | **3.7 ms** |
+
+The NPU's best kernel is ~1.6x off the iGPU on the shape it does best; with the rest of the UNet on the
+iGPU as well, that is the 4.5x per image of section 5.
 
 ### 4a. Memory bandwidth (`scripts/13-mem-bandwidth.py`, `logs/13-mem-bandwidth.log`)
 
