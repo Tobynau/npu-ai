@@ -12,5 +12,4 @@ __pycache__/
 *.xclbin
 outputs/
 docker/*.log
-README.draft.md
 tools/
