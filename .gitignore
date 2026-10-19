@@ -1,0 +1,16 @@
+models/
+logs/
+third_party/
+reference/
+wheelhouse/
+xrt-root/
+xrt-debs/
+docker/wheels/
+.venv/
+build/
+__pycache__/
+*.xclbin
+outputs/
+docker/*.log
+README.draft.md
+tools/

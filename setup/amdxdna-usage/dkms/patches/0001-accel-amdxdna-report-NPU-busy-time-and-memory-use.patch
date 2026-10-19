@@ -1,0 +1,361 @@
+From d64187e855b357e624a18dfc780ab0624852be00 Mon Sep 17 00:00:00 2001
+From: npu-ai <198290020+Tobynau@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 17:43:20 -1000
+Subject: [PATCH] accel/amdxdna: report NPU busy time and memory use
+
+Account the time each command spends on the device (posted to firmware
+until firmware responds), weighted by the columns its context occupies,
+so a context on all usable columns counts as the whole NPU being busy.
+
+Exposed per client as drm-engine-npu-amdxdna in fdinfo, and per device
+in sysfs as npu_busy_time_us (cumulative), npu_busy_percent (since the
+previous read at least 100 ms ago) and npu_memory_utilization (bytes of
+BOs held by all clients). These are the names GNOME Resources reads.
+---
+ aie2_ctx.c        |   6 +++
+ aie2_pci.c        |   2 +
+ amdxdna_ctx.c     | 116 ++++++++++++++++++++++++++++++++++++++++++++++
+ amdxdna_ctx.h     |   4 ++
+ amdxdna_pci_drv.c |   4 ++
+ amdxdna_pci_drv.h |  35 ++++++++++++++
+ amdxdna_sysfs.c   |  38 +++++++++++++++
+ 7 files changed, 205 insertions(+)
+
+diff --git a/aie2_ctx.c b/aie2_ctx.c
+index b713a57..d9d8519 100644
+--- a/aie2_ctx.c
++++ b/aie2_ctx.c
+@@ -79,6 +79,8 @@ static void aie2_job_release(struct kref *ref)
+ 
+ 	job = container_of(ref, struct amdxdna_sched_job, refcnt);
+ 
++	/* Backstop for commands that never got a firmware response */
++	amdxdna_busy_end(job);
+ 	amdxdna_sched_job_cleanup(job);
+ 	atomic64_inc(&job->hwctx->job_free_cnt);
+ 	wake_up(&job->hwctx->priv->job_free_wq);
+@@ -228,6 +230,7 @@ aie2_sched_notify(struct amdxdna_sched_job *job)
+ 		       job->seq, job->drv_cmd ? job->drv_cmd->opcode : DEFAULT_IO);
+ 
+ 	aie2_tdr_signal(job->hwctx->client->xdna);
++	amdxdna_busy_end(job);
+ 	job->hwctx->priv->completed++;
+ 	dma_fence_signal(fence);
+ 
+@@ -422,6 +425,8 @@ aie2_sched_job_run(struct drm_sched_job *sched_job)
+ 
+ 	amdxdna_cmd_set_state(cmd_abo, ERT_CMD_STATE_NEW);
+ 
++	/* Before posting: the response may arrive before execbuf returns */
++	amdxdna_busy_begin(job);
+ 	if (amdxdna_cmd_get_op(cmd_abo) == ERT_CMD_CHAIN)
+ 		ret = aie2_cmdlist_multi_execbuf(hwctx, job, aie2_sched_cmdlist_resp_handler);
+ 	else if (force_cmdlist)
+@@ -431,6 +436,7 @@ aie2_sched_job_run(struct drm_sched_job *sched_job)
+ 
+ out:
+ 	if (ret) {
++		amdxdna_busy_end(job);
+ 		dma_fence_put(job->fence);
+ 		aie2_job_put(job);
+ 		mmput(job->mm);
+diff --git a/aie2_pci.c b/aie2_pci.c
+index daec1f6..4a0c9bb 100644
+--- a/aie2_pci.c
++++ b/aie2_pci.c
+@@ -226,6 +226,8 @@ static int aie2_mgmt_fw_query(struct amdxdna_dev_hdl *ndev)
+ 	}
+ 
+ 	ndev->total_col = min(aie2_max_col, ndev->aie.metadata.cols);
++	ndev->aie.xdna->busy_capacity =
++		ndev->total_col - min_t(u32, ndev->total_col, ndev->aie.xdna->dev_info->first_col);
+ 
+ 	return 0;
+ }
+diff --git a/amdxdna_ctx.c b/amdxdna_ctx.c
+index 31a414c..35787b7 100644
+--- a/amdxdna_ctx.c
++++ b/amdxdna_ctx.c
+@@ -570,6 +570,122 @@ put_shmem_bo:
+ 	return ret;
+ }
+ 
++static void amdxdna_busy_update(struct amdxdna_busy *busy, u64 now)
++{
++	busy->col_ns += (u64)busy->busy_cols * (now - busy->last_ns);
++	busy->last_ns = now;
++}
++
++static void amdxdna_busy_get(struct amdxdna_busy *busy, u32 start, u32 num, u64 now)
++{
++	u32 col;
++
++	amdxdna_busy_update(busy, now);
++	for (col = start; col < start + num; col++) {
++		if (!busy->col_ref[col]++)
++			busy->busy_cols++;
++	}
++}
++
++static void amdxdna_busy_put(struct amdxdna_busy *busy, u32 start, u32 num, u64 now)
++{
++	u32 col;
++
++	amdxdna_busy_update(busy, now);
++	for (col = start; col < start + num; col++) {
++		if (busy->col_ref[col] && !--busy->col_ref[col])
++			busy->busy_cols--;
++	}
++}
++
++void amdxdna_busy_begin(struct amdxdna_sched_job *job)
++{
++	struct amdxdna_hwctx *hwctx = job->hwctx;
++	struct amdxdna_client *client = hwctx->client;
++	struct amdxdna_dev *xdna = client->xdna;
++	unsigned long flags;
++	u64 now;
++
++	if (!hwctx->num_col || hwctx->start_col + hwctx->num_col > AMDXDNA_BUSY_MAX_COLS)
++		return;
++
++	spin_lock_irqsave(&xdna->busy_lock, flags);
++	if (!job->busy) {
++		job->busy = true;
++		job->busy_start_col = hwctx->start_col;
++		job->busy_num_col = hwctx->num_col;
++		now = ktime_get_ns();
++		amdxdna_busy_get(&xdna->busy, job->busy_start_col, job->busy_num_col, now);
++		amdxdna_busy_get(&client->busy, job->busy_start_col, job->busy_num_col, now);
++	}
++	spin_unlock_irqrestore(&xdna->busy_lock, flags);
++}
++
++void amdxdna_busy_end(struct amdxdna_sched_job *job)
++{
++	struct amdxdna_client *client = job->hwctx->client;
++	struct amdxdna_dev *xdna = client->xdna;
++	unsigned long flags;
++	u64 now;
++
++	spin_lock_irqsave(&xdna->busy_lock, flags);
++	if (job->busy) {
++		job->busy = false;
++		now = ktime_get_ns();
++		amdxdna_busy_put(&xdna->busy, job->busy_start_col, job->busy_num_col, now);
++		amdxdna_busy_put(&client->busy, job->busy_start_col, job->busy_num_col, now);
++	}
++	spin_unlock_irqrestore(&xdna->busy_lock, flags);
++}
++
++static u64 amdxdna_busy_time_ns_locked(struct amdxdna_dev *xdna, struct amdxdna_busy *busy)
++{
++	amdxdna_busy_update(busy, ktime_get_ns());
++	return div_u64(busy->col_ns, xdna->busy_capacity);
++}
++
++/* Time the whole array was busy; partial occupancy counts proportionally */
++u64 amdxdna_busy_time_ns(struct amdxdna_dev *xdna, struct amdxdna_busy *busy)
++{
++	unsigned long flags;
++	u64 busy_ns;
++
++	if (!xdna->busy_capacity)
++		return 0;
++
++	spin_lock_irqsave(&xdna->busy_lock, flags);
++	busy_ns = amdxdna_busy_time_ns_locked(xdna, busy);
++	spin_unlock_irqrestore(&xdna->busy_lock, flags);
++
++	return busy_ns;
++}
++
++/* Device busy percentage since the previous call at least 100 ms ago */
++u32 amdxdna_busy_percent(struct amdxdna_dev *xdna)
++{
++	unsigned long flags;
++	u64 busy_ns, now, dt;
++	u32 percent;
++
++	if (!xdna->busy_capacity)
++		return 0;
++
++	spin_lock_irqsave(&xdna->busy_lock, flags);
++	busy_ns = amdxdna_busy_time_ns_locked(xdna, &xdna->busy);
++	now = xdna->busy.last_ns;
++	dt = now - xdna->busy_sample_ns;
++	if (dt >= 100 * NSEC_PER_MSEC) {
++		xdna->busy_sample_percent =
++			min_t(u64, 100, div64_u64(100 * (busy_ns - xdna->busy_sample_busy_ns) + dt / 2, dt));
++		xdna->busy_sample_ns = now;
++		xdna->busy_sample_busy_ns = busy_ns;
++	}
++	percent = xdna->busy_sample_percent;
++	spin_unlock_irqrestore(&xdna->busy_lock, flags);
++
++	return percent;
++}
++
+ void amdxdna_sched_job_cleanup(struct amdxdna_sched_job *job)
+ {
+ 	trace_amdxdna_debug_point(job->hwctx->name, job->seq, "job release");
+diff --git a/amdxdna_ctx.h b/amdxdna_ctx.h
+index b6bef3a..d0a9e78 100644
+--- a/amdxdna_ctx.h
++++ b/amdxdna_ctx.h
+@@ -154,6 +154,10 @@ struct amdxdna_sched_job {
+ 	u64			seq;
+ 	struct amdxdna_drv_cmd	*drv_cmd;
+ 	struct amdxdna_gem_obj	*cmd_bo;
++	/* Columns held in xdna->busy while the command is on the device */
++	bool			busy;
++	u32			busy_start_col;
++	u32			busy_num_col;
+ 	union amdxdna_job_priv	priv;
+ 	size_t			bo_cnt;
+ 	struct drm_gem_object	*bos[] __counted_by(bo_cnt);
+diff --git a/amdxdna_pci_drv.c b/amdxdna_pci_drv.c
+index bb339e6..e476095 100644
+--- a/amdxdna_pci_drv.c
++++ b/amdxdna_pci_drv.c
+@@ -304,6 +304,9 @@ static void amdxdna_show_fdinfo(struct drm_printer *p, struct drm_file *filp)
+ 	drm_fdinfo_print_size(p, drv_name, "heap", "alloc", heap_usage);
+ 	drm_fdinfo_print_size(p, drv_name, "internal", "alloc", internal_usage);
+ 	drm_fdinfo_print_size(p, drv_name, "external", "alloc", external_usage);
++	if (client->xdna->busy_capacity)
++		drm_printf(p, "drm-engine-npu-amdxdna:\t%llu ns\n",
++			   amdxdna_busy_time_ns(client->xdna, &client->busy));
+ 	/*
+ 	 * Note for DRM standard BO memory stat.
+ 	 * drm-total-memory counts both DEV BO and HEAP BO. The DEV BO size is double counted.
+@@ -389,6 +392,7 @@ static int amdxdna_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 
+ 	init_rwsem(&xdna->notifier_lock);
+ 	INIT_LIST_HEAD(&xdna->client_list);
++	spin_lock_init(&xdna->busy_lock);
+ 	pci_set_drvdata(pdev, xdna);
+ 
+ 	ret = drmm_add_action(ddev, amdxdna_xdna_drm_release, xdna);
+diff --git a/amdxdna_pci_drv.h b/amdxdna_pci_drv.h
+index a997d27..64d8bff 100644
+--- a/amdxdna_pci_drv.h
++++ b/amdxdna_pci_drv.h
+@@ -112,6 +112,26 @@ struct amdxdna_fw_ver {
+ 
+ struct amdxdna_carveout;
+ 
++#define AMDXDNA_BUSY_MAX_COLS	32
++
++/*
++ * struct amdxdna_busy - NPU column busy-time accounting
++ * @col_ref: number of in-flight commands holding each column
++ * @busy_cols: number of columns with at least one in-flight command
++ * @last_ns: time of the last update
++ * @col_ns: busy_cols integrated over time, in column-nanoseconds
++ *
++ * A command counts as busy from the moment it is posted to firmware until
++ * firmware responds. Dividing col_ns by the number of columns a context can
++ * occupy gives the time the whole array was busy.
++ */
++struct amdxdna_busy {
++	u16				col_ref[AMDXDNA_BUSY_MAX_COLS];
++	u32				busy_cols;
++	u64				last_ns;
++	u64				col_ns;
++};
++
+ struct amdxdna_dev {
+ 	struct drm_device		ddev;
+ 	struct amdxdna_dev_hdl		*dev_handle;
+@@ -132,6 +152,13 @@ struct amdxdna_dev {
+ 	const char			*vbnv;
+ 
+ 	struct amdxdna_carveout		*carveout;
++
++	spinlock_t			busy_lock; /* busy, busy_sample_*, client busy */
++	struct amdxdna_busy		busy;
++	u32				busy_capacity; /* columns a context can occupy */
++	u64				busy_sample_ns;
++	u64				busy_sample_busy_ns;
++	u32				busy_sample_percent;
+ };
+ 
+ /*
+@@ -169,6 +196,8 @@ struct amdxdna_client {
+ 	size_t				heap_usage;
+ 	size_t				total_bo_usage;
+ 	size_t				total_int_bo_usage;
++
++	struct amdxdna_busy		busy; /* protected by xdna->busy_lock */
+ };
+ 
+ #define amdxdna_for_each_hwctx(client, hwctx_id, entry)		\
+@@ -183,6 +212,12 @@ extern const struct amdxdna_dev_info dev_npu5_info;
+ extern const struct amdxdna_dev_info dev_npu6_info;
+ 
+ int amdxdna_sysfs_init(struct amdxdna_dev *xdna);
++
++struct amdxdna_sched_job;
++void amdxdna_busy_begin(struct amdxdna_sched_job *job);
++void amdxdna_busy_end(struct amdxdna_sched_job *job);
++u64 amdxdna_busy_time_ns(struct amdxdna_dev *xdna, struct amdxdna_busy *busy);
++u32 amdxdna_busy_percent(struct amdxdna_dev *xdna);
+ void amdxdna_sysfs_fini(struct amdxdna_dev *xdna);
+ 
+ int amdxdna_iommu_init(struct amdxdna_dev *xdna);
+diff --git a/amdxdna_sysfs.c b/amdxdna_sysfs.c
+index d9e359e..7547c43 100644
+--- a/amdxdna_sysfs.c
++++ b/amdxdna_sysfs.c
+@@ -42,10 +42,48 @@ static ssize_t fw_version_show(struct device *dev, struct device_attribute *attr
+ }
+ static DEVICE_ATTR_RO(fw_version);
+ 
++static ssize_t npu_busy_time_us_show(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	struct amdxdna_dev *xdna = dev_get_drvdata(dev);
++
++	return sysfs_emit(buf, "%llu\n", div_u64(amdxdna_busy_time_ns(xdna, &xdna->busy), 1000));
++}
++static DEVICE_ATTR_RO(npu_busy_time_us);
++
++static ssize_t npu_busy_percent_show(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	struct amdxdna_dev *xdna = dev_get_drvdata(dev);
++
++	return sysfs_emit(buf, "%u\n", amdxdna_busy_percent(xdna));
++}
++static DEVICE_ATTR_RO(npu_busy_percent);
++
++static ssize_t npu_memory_utilization_show(struct device *dev, struct device_attribute *attr,
++					   char *buf)
++{
++	struct amdxdna_dev *xdna = dev_get_drvdata(dev);
++	struct amdxdna_client *client;
++	u64 total = 0;
++
++	mutex_lock(&xdna->client_lock);
++	list_for_each_entry(client, &xdna->client_list, node) {
++		mutex_lock(&client->mm_lock);
++		total += client->total_bo_usage;
++		mutex_unlock(&client->mm_lock);
++	}
++	mutex_unlock(&xdna->client_lock);
++
++	return sysfs_emit(buf, "%llu\n", total);
++}
++static DEVICE_ATTR_RO(npu_memory_utilization);
++
+ static struct attribute *amdxdna_attrs[] = {
+ 	&dev_attr_device_type.attr,
+ 	&dev_attr_vbnv.attr,
+ 	&dev_attr_fw_version.attr,
++	&dev_attr_npu_busy_time_us.attr,
++	&dev_attr_npu_busy_percent.attr,
++	&dev_attr_npu_memory_utilization.attr,
+ 	NULL,
+ };
+ 
+-- 
+2.53.0
+

@@ -1,0 +1,12 @@
+# ComfyUI extra model paths used inside the container (docker/run.sh mounts ~/ComfyUI/models at /comfy-models)
+host_comfyui:
+    base_path: /comfy-models
+    checkpoints: checkpoints
+    diffusion_models: diffusion_models
+    unet: unet
+    text_encoders: text_encoders
+    clip: clip
+    vae: vae
+    loras: loras
+    upscale_models: upscale_models
+    controlnet: controlnet
